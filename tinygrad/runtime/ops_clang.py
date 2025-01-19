@@ -1,31 +1,37 @@
-import os, time, ctypes, hashlib, subprocess, platform, tempfile, functools
-from tinygrad.ops import Compiled
-from tinygrad.runtime.lib import RawMallocBuffer
-from tinygrad.codegen.linearizer import LinearizerOptions
-from tinygrad.renderer.cstyle import uops_to_cstyle, CStyleLanguage
+import platform, tempfile, pathlib, subprocess
+from tinygrad.helpers import cpu_objdump, capstone_flatdump
+from tinygrad.device import Compiled, Compiler, MallocAllocator, CPUProgram
+from tinygrad.runtime.support.elf import jit_loader
+from tinygrad.renderer.cstyle import ClangRenderer
 
-args = {
-  'Windows': {'cflags':'', 'ext':'dll', 'exp':'__declspec(dllexport)'},
-  'Linux': {'cflags':'-lm -fPIC --rtlib=compiler-rt ', 'ext':'so', 'exp':''},
-  'Darwin': {'cflags':'-lm -fPIC --rtlib=compiler-rt ', 'ext':'dylib', 'exp':''}
-}[platform.system()]
+# Used by ops_dsp.py
+class ClangCompiler(Compiler):
+  def __init__(self, cachekey="compile_clang", args:list[str]|None=None, objdump_tool='objdump'):
+    self.args = ['-march=native'] if args is None else args
+    self.objdump_tool = objdump_tool
+    super().__init__(cachekey)
 
-CLANG_PROGRAM_HEADER = '#include <math.h>\n#define max(x,y) ((x>y)?x:y)\n#define int64 long\n#define half __fp16\n#define uchar unsigned char\n#define bool uchar\n'
-class ClangProgram:
-  def __init__(self, name:str, prg:str):
-    prg = CLANG_PROGRAM_HEADER + prg
-    # TODO: is there a way to not write this to disk?
-    fn = f"{tempfile.gettempdir()}/clang_{hashlib.md5(prg.encode('utf-8')).hexdigest()}.{args['ext']}"
-    if not os.path.exists(fn):
-      subprocess.check_output(args=('clang -shared -O2 -Wall -Werror -x c '+args['cflags']+' - -o '+fn+'.tmp').split(), input=prg.encode('utf-8'))
-      os.rename(fn+'.tmp', fn)
-    self.lib = ctypes.CDLL(fn)
-    self.fxn = self.lib[name]
+  def compile(self, src:str) -> bytes:
+    # TODO: remove file write. sadly clang doesn't like the use of /dev/stdout here
+    with tempfile.NamedTemporaryFile(delete=True) as output_file:
+      subprocess.check_output(['clang', '-shared', *self.args, '-O2', '-Wall', '-Werror', '-x', 'c', '-fPIC', '-ffreestanding', '-nostdlib',
+                               '-', '-o', str(output_file.name)], input=src.encode('utf-8'))
+      return pathlib.Path(output_file.name).read_bytes()
 
-  def __call__(self, global_size, local_size, *args, wait=False):
-    if wait: st = time.monotonic()
-    self.fxn(*[x._buf for x in args])
-    if wait: return time.monotonic()-st
+  def disassemble(self, lib:bytes): return cpu_objdump(lib, self.objdump_tool)
 
-renderer = functools.partial(uops_to_cstyle, CStyleLanguage(kernel_prefix=args['exp'], buffer_suffix=" restrict"))
-ClangBuffer = Compiled(RawMallocBuffer, LinearizerOptions(supports_float4=False, has_local=False), renderer, ClangProgram)
+class ClangJITCompiler(Compiler):
+  def __init__(self, cachekey="compile_clang_jit"): super().__init__(cachekey)
+
+  def compile(self, src:str) -> bytes:
+    # -fno-math-errno is required for __builtin_sqrt to become an instruction instead of a function call
+    # x18 is a reserved platform register. It is clobbered on context switch in macos and is used to store TEB pointer in windows on arm, don't use it
+    args = ['-march=native', f'--target={platform.machine()}-none-unknown-elf', '-O2', '-fPIC', '-ffreestanding', '-fno-math-errno', '-nostdlib']
+    arch_args = ['-ffixed-x18'] if platform.machine() == 'arm64' else []
+    obj = subprocess.check_output(['clang', '-c', '-x', 'c', *args, *arch_args, '-', '-o', '-'], input=src.encode('utf-8'))
+    return jit_loader(obj)
+
+  def disassemble(self, lib:bytes): return capstone_flatdump(lib)
+
+class ClangDevice(Compiled):
+  def __init__(self, device:str): super().__init__(device, MallocAllocator, ClangRenderer(), ClangJITCompiler(), CPUProgram)
